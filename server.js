@@ -455,6 +455,15 @@ if (require.main === module) {
     console.log('  ║   SOC Analyst Boot Camp — Training Hub   ║');
     console.log(`  ║   ${url.padEnd(39)}║`);
     console.log('  ╚══════════════════════════════════════════╝\n');
+  }).on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`\n  Port ${PORT} is already in use — is the boot camp already running?\n  Close it, or start on another port: PORT=3001 npm start\n`);
+    } else if (err.code === 'EACCES') {
+      console.error(`\n  No permission to listen on ${HOST}:${PORT}. Try a port above 1024.\n`);
+    } else {
+      console.error(err);
+    }
+    process.exit(1);
   });
 }
 

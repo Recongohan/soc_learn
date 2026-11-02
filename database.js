@@ -28,9 +28,16 @@ function addDays(dateStr, n) {
 
 function init() {
   if (db) return db;
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  db = new Database(DB_PATH);
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true, mode: 0o700 });
+  // The DB holds password hashes, notes and live session IDs: keep it owner-only (0600),
+  // including databases created by older versions. SQLite gives -wal/-shm the DB file's mode.
+  const oldMask = process.umask(0o077);
+  try { db = new Database(DB_PATH); } finally { process.umask(oldMask); }
+  try { fs.chmodSync(DB_PATH, 0o600); } catch { /* e.g. Windows or read-only FS */ }
   db.pragma('journal_mode = WAL');
+  for (const f of [DB_PATH + '-wal', DB_PATH + '-shm']) {
+    try { fs.chmodSync(f, 0o600); } catch { /* not created yet */ }
+  }
   db.pragma('foreign_keys = ON');
 
   db.exec(`
