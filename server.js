@@ -22,7 +22,13 @@ const ALLOWED_HOSTS = new Set([
 const sqlite = db.init();
 const app = express();
 app.disable('x-powered-by');
-if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
+// Trust X-Forwarded-For only from the proxy itself, never from arbitrary direct clients:
+// TRUST_PROXY=1/true -> proxy on this machine (loopback); otherwise an explicit address/CIDR list
+// (e.g. TRUST_PROXY=10.0.0.5 or TRUST_PROXY=uniquelocal), passed to Express as-is.
+if (process.env.TRUST_PROXY) {
+  const tp = process.env.TRUST_PROXY.trim();
+  app.set('trust proxy', /^(1|true|yes)$/i.test(tp) ? 'loopback' : tp.split(',').map(s => s.trim()).filter(Boolean));
+}
 
 // Reject requests whose Host header isn't ours, so a malicious site can't DNS-rebind onto this server.
 app.use((req, res, next) => {
@@ -135,14 +141,32 @@ const loginByAccount = new RateLimiter(10, 15 * MIN); // failed logins per IP + 
 const loginByIp = new RateLimiter(50, 15 * MIN);      // failed logins per IP across all usernames (spraying)
 const registerByIp = new RateLimiter(10, 60 * MIN);   // account creations per IP
 const passwordByUser = new RateLimiter(10, 15 * MIN); // failed current-password checks per user
-setInterval(() => [loginByAccount, loginByIp, registerByIp, passwordByUser].forEach(l => l.prune()), 5 * MIN).unref();
+const loginAttemptsByIp = new RateLimiter(30, 15 * MIN); // ALL login attempts per IP (bcrypt work is the cost)
+const emailConflictsByUser = new RateLimiter(5, 60 * MIN); // "email already in use" answers per user (enumeration)
+const writesByUser = new RateLimiter(600, 60 * MIN);  // row-creating writes per user (storage growth)
+const LIMITERS = [loginByAccount, loginByIp, registerByIp, passwordByUser, loginAttemptsByIp, emailConflictsByUser, writesByUser];
+setInterval(() => LIMITERS.forEach(l => l.prune()), 5 * MIN).unref();
+const MAX_SESSIONS_PER_USER = 10;
+
+/** Middleware: count a row-creating write against the user's hourly budget. */
+function limitWrites(req, res, next) {
+  if (writesByUser.blocked(req.session.userId)) return tooMany(res, 'saves this hour');
+  writesByUser.hit(req.session.userId);
+  next();
+}
 const tooMany = (res, what) => res.status(429).json({ error: `Too many ${what}. Try again later.` });
 
 function startSession(req, res, userId, payload) {
   req.session.regenerate(err => {
     if (err) return res.status(500).json({ error: 'Session error' });
     req.session.userId = userId;
-    req.session.save(() => res.json(payload));
+    req.session.save(() => {
+      // Cap live sessions per account: keep only the newest MAX_SESSIONS_PER_USER.
+      sqlite.prepare(`DELETE FROM sessions WHERE json_extract(sess, '$.userId') = ? AND sid NOT IN (
+        SELECT sid FROM sessions WHERE json_extract(sess, '$.userId') = ? ORDER BY expires DESC LIMIT ?)`)
+        .run(userId, userId, MAX_SESSIONS_PER_USER);
+      res.json(payload);
+    });
   });
 }
 
@@ -169,17 +193,23 @@ app.post('/api/register', (req, res) => {
   }
 });
 
-app.post('/api/login', (req, res) => {
-  const login = str(req.body.username, 120).trim();
-  const accountKey = `${req.ip}|${login.toLowerCase()}`;
-  if (loginByAccount.blocked(accountKey) || loginByIp.blocked(req.ip)) return tooMany(res, 'failed login attempts');
-  const user = db.authenticateUser(login, str(req.body.password, 200));
-  if (!user) {
-    loginByAccount.hit(accountKey); loginByIp.hit(req.ip);
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-  loginByAccount.reset(accountKey);
-  startSession(req, res, user.id, { success: true, user });
+app.post('/api/login', async (req, res, next) => {
+  try {
+    const login = str(req.body.username, 120).trim();
+    const accountKey = `${req.ip}|${login.toLowerCase()}`;
+    if (loginByAccount.blocked(accountKey) || loginByIp.blocked(req.ip)) return tooMany(res, 'failed login attempts');
+    // Every attempt (success or failure) costs a bcrypt hash, so every attempt is counted.
+    if (loginAttemptsByIp.blocked(req.ip)) return tooMany(res, 'login attempts');
+    loginAttemptsByIp.hit(req.ip);
+    // bcrypt runs on a worker thread (database.js), so one login no longer freezes everyone.
+    const user = await db.authenticateUser(login, str(req.body.password, 200));
+    if (!user) {
+      loginByAccount.hit(accountKey); loginByIp.hit(req.ip);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    loginByAccount.reset(accountKey);
+    startSession(req, res, user.id, { success: true, user });
+  } catch (e) { next(e); }
 });
 
 app.post('/api/logout', (req, res) => {
@@ -203,30 +233,37 @@ app.put('/api/profile', requireAuth, (req, res) => {
   if (!EMAIL_RE.test(email)) return bad(res, 'Enter a valid email');
   if (!Number.isInteger(weeklyGoalHours) || weeklyGoalHours < 1 || weeklyGoalHours > 80) return bad(res, 'Weekly goal must be 1–80 hours');
   if (!isValidDate(startDate)) return bad(res, 'Invalid start date');
+  // "Email already in use" reveals that an account exists, so cap how often one user can get that answer.
+  if (emailConflictsByUser.blocked(req.session.userId)) return tooMany(res, 'email change attempts');
   try {
     res.json({ success: true, user: db.updateProfile(req.session.userId, { displayName, email, weeklyGoalHours, startDate }) });
   } catch (e) {
-    if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'That email is already in use' });
+    if (String(e.message).includes('UNIQUE')) {
+      emailConflictsByUser.hit(req.session.userId);
+      return res.status(409).json({ error: 'That email is already in use' });
+    }
     throw e;
   }
 });
 
-app.post('/api/password', requireAuth, (req, res) => {
-  const uid = req.session.userId;
-  if (passwordByUser.blocked(uid)) return tooMany(res, 'incorrect password attempts');
-  const current = str(req.body.currentPassword, 200);
-  const next = str(req.body.newPassword, 200);
-  const pwErr = passwordProblem(next);
-  if (pwErr) return bad(res, `New p${pwErr.slice(1)}`);
-  if (!db.changePassword(uid, current, next)) {
-    passwordByUser.hit(uid);
-    return res.status(403).json({ error: 'Current password is incorrect' });
-  }
-  passwordByUser.reset(uid);
-  // Log out every other session for this account (e.g. a forgotten shared-machine login).
-  const revoked = sqlite.prepare("DELETE FROM sessions WHERE json_extract(sess, '$.userId') = ? AND sid != ?")
-    .run(uid, req.sessionID).changes;
-  res.json({ success: true, otherSessionsRevoked: revoked });
+app.post('/api/password', requireAuth, async (req, res, next) => {
+  try {
+    const uid = req.session.userId;
+    if (passwordByUser.blocked(uid)) return tooMany(res, 'incorrect password attempts');
+    const current = str(req.body.currentPassword, 200);
+    const newPw = str(req.body.newPassword, 200);
+    const pwErr = passwordProblem(newPw);
+    if (pwErr) return bad(res, `New p${pwErr.slice(1)}`);
+    if (!(await db.changePassword(uid, current, newPw))) {
+      passwordByUser.hit(uid);
+      return res.status(403).json({ error: 'Current password is incorrect' });
+    }
+    passwordByUser.reset(uid);
+    // Log out every other session for this account (e.g. a forgotten shared-machine login).
+    const revoked = sqlite.prepare("DELETE FROM sessions WHERE json_extract(sess, '$.userId') = ? AND sid != ?")
+      .run(uid, req.sessionID).changes;
+    res.json({ success: true, otherSessionsRevoked: revoked });
+  } catch (e) { next(e); }
 });
 
 app.post('/api/reset', requireAuth, (req, res) => {
@@ -281,7 +318,7 @@ app.get('/api/resources', requireAuth, (req, res) => {
 });
 
 // ── Progress ──
-app.post('/api/progress', requireAuth, (req, res) => {
+app.post('/api/progress', requireAuth, limitWrites, (req, res) => {
   const week = parseWeek(req.body.week);
   const { section } = req.body;
   if (!week || !SECTIONS.includes(section)) return bad(res, 'Invalid week or section');
@@ -289,7 +326,7 @@ app.post('/api/progress', requireAuth, (req, res) => {
   res.json({ success: true, streak: db.getStreak(req.session.userId) });
 });
 
-app.post('/api/progress/time', requireAuth, (req, res) => {
+app.post('/api/progress/time', requireAuth, limitWrites, (req, res) => {
   const week = parseWeek(req.body.week);
   const minutes = Math.round(Number(req.body.minutes));
   if (!week || !SECTIONS.includes(req.body.section)) return bad(res, 'Invalid week or section');
@@ -340,7 +377,7 @@ app.post('/api/quiz/:week/check', requireAuth, (req, res) => {
 });
 
 // Step 2: submit self-grades → score saved. correct = 2 pts, partial = 1, incorrect = 0.
-app.post('/api/quiz/:week', requireAuth, (req, res) => {
+app.post('/api/quiz/:week', requireAuth, limitWrites, (req, res) => {
   const w = getWeek(req.params.week);
   if (!w) return res.status(404).json({ error: 'Quiz not found' });
   const n = w.quiz.questions.length;
@@ -364,7 +401,7 @@ app.get('/api/quiz/:week/history', requireAuth, (req, res) => {
 });
 
 // ── Lab checklist ──
-app.post('/api/lab/check', requireAuth, (req, res) => {
+app.post('/api/lab/check', requireAuth, limitWrites, (req, res) => {
   const w = getWeek(req.body.week);
   const idx = Number(req.body.itemIndex);
   if (!w || !Number.isInteger(idx) || idx < 0 || idx >= w.lab.steps.length) return bad(res, 'Invalid week or step');
@@ -392,11 +429,12 @@ app.get('/api/notes/:week', requireAuth, (req, res) => {
 });
 
 // ── Daily log ──
-app.post('/api/daily-log', requireAuth, (req, res) => {
+app.post('/api/daily-log', requireAuth, limitWrites, (req, res) => {
   const { date, mood } = req.body;
   const hours = Number(req.body.hours);
   if (!isValidDate(date)) return bad(res, 'Invalid date');
   if (date > db.localDate()) return bad(res, "You can't log study time for a future date");
+  if (date < db.addDays(db.localDate(), -366)) return bad(res, 'You can only log study time for the past year');
   if (!Number.isFinite(hours) || hours < 0 || hours > 24) return bad(res, 'Hours must be between 0 and 24');
   if (mood && !MOODS.includes(mood)) return bad(res, 'Invalid mood');
   db.saveDailyLog(req.session.userId, date, Math.round(hours * 4) / 4, str(req.body.topics, 2000), mood || null, str(req.body.notes, 5000));
@@ -444,6 +482,9 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON' });
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Request too large' });
+  // Client errors raised by Express/body-parser (bad URI encoding, unsupported charset, aborted request) keep their 4xx code.
+  const status = err.status || err.statusCode;
+  if (status >= 400 && status < 500) return res.status(status).json({ error: 'Bad request' });
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });

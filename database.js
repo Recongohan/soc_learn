@@ -152,9 +152,34 @@ function createUser(username, email, password, displayName) {
   return Number(result.lastInsertRowid);
 }
 
-function authenticateUser(login, password) {
+// bcrypt off the main thread (bcrypt-worker.js), so one login or password change cannot stall other requests.
+const { Worker } = require('worker_threads');
+let bcryptWorker = null, bcryptSeq = 0;
+const bcryptPending = new Map();
+function failPending(err) { for (const p of bcryptPending.values()) p.reject(err); bcryptPending.clear(); bcryptWorker = null; }
+function bcryptOffThread(op, a, b) {
+  if (!bcryptWorker) {
+    bcryptWorker = new Worker(path.join(__dirname, 'bcrypt-worker.js'));
+    bcryptWorker.unref(); // never keeps the process alive by itself
+    bcryptWorker.on('message', ({ id, ok, result, error }) => {
+      const p = bcryptPending.get(id);
+      if (!p) return;
+      bcryptPending.delete(id);
+      ok ? p.resolve(result) : p.reject(new Error(error));
+    });
+    bcryptWorker.on('error', failPending);
+    bcryptWorker.on('exit', code => { if (code !== 0) failPending(new Error(`bcrypt worker exited (${code})`)); else bcryptWorker = null; });
+  }
+  return new Promise((resolve, reject) => {
+    const id = ++bcryptSeq;
+    bcryptPending.set(id, { resolve, reject });
+    bcryptWorker.postMessage({ id, op, a, b });
+  });
+}
+
+async function authenticateUser(login, password) {
   const user = getDb().prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(login, login);
-  const ok = bcrypt.compareSync(password, user ? user.password_hash : DUMMY_HASH);
+  const ok = await bcryptOffThread('compare', password, user ? user.password_hash : DUMMY_HASH);
   if (!user || !ok) return null;
   getDb().prepare('UPDATE users SET last_login = ? WHERE id = ?').run(localDateTime(), user.id);
   return getUser(user.id);
@@ -173,17 +198,24 @@ function updateProfile(userId, { displayName, email, weeklyGoalHours, startDate 
   return getUser(userId);
 }
 
-function changePassword(userId, currentPassword, newPassword) {
+async function changePassword(userId, currentPassword, newPassword) {
   const row = getDb().prepare('SELECT password_hash FROM users WHERE id = ?').get(userId);
-  if (!row || !bcrypt.compareSync(currentPassword, row.password_hash)) return false;
-  getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newPassword, 10), userId);
+  if (!row || !(await bcryptOffThread('compare', currentPassword, row.password_hash))) return false;
+  const hash = await bcryptOffThread('hash', newPassword, 10);
+  getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
   return true;
 }
 
 // ── Activity + streak ──
+const MAX_ACTIVITY_PER_DAY = 200; // per user; older rows from the same day are pruned (streaks only need one per day)
 function logActivity(userId, action, detail, week) {
+  const now = localDateTime();
   getDb().prepare('INSERT INTO activity_log (user_id, action, detail, week, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(userId, action, detail || null, week || null, localDateTime());
+    .run(userId, action, detail || null, week || null, now);
+  const day = now.slice(0, 10);
+  getDb().prepare(`DELETE FROM activity_log WHERE user_id = ? AND created_at >= ? AND created_at < ? AND id NOT IN (
+    SELECT id FROM activity_log WHERE user_id = ? AND created_at >= ? AND created_at < ? ORDER BY id DESC LIMIT ?)`)
+    .run(userId, `${day} 00:00:00`, `${addDays(day, 1)} 00:00:00`, userId, `${day} 00:00:00`, `${addDays(day, 1)} 00:00:00`, MAX_ACTIVITY_PER_DAY);
   if (STUDY_ACTIONS.includes(action)) updateStreak(userId);
 }
 
@@ -278,10 +310,14 @@ function getWeekProgress(userId, week) {
 }
 
 // ── Quiz ──
+const MAX_ATTEMPTS_PER_WEEK = 20; // keep the newest attempts per user per week
 function saveQuizAttempt(userId, week, answers, grades, score, total) {
   getDb().prepare(
     'INSERT INTO quiz_attempts (user_id, week, answers, grades, score, total, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ).run(userId, week, JSON.stringify(answers), JSON.stringify(grades), score, total, localDateTime());
+  getDb().prepare(`DELETE FROM quiz_attempts WHERE user_id = ? AND week = ? AND id NOT IN (
+    SELECT id FROM quiz_attempts WHERE user_id = ? AND week = ? ORDER BY id DESC LIMIT ?)`)
+    .run(userId, week, userId, week, MAX_ATTEMPTS_PER_WEEK);
   logActivity(userId, 'quiz_completed', `Week ${week}: ${Math.round((score / total) * 100)}%`, week);
 }
 

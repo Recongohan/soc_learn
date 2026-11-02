@@ -20,7 +20,7 @@ Environment options (put them in a `.env`-style shell export; `.env*` files are 
 | `HOST` | `127.0.0.1` | Interface to bind. `0.0.0.0` exposes it on your LAN — see the warning below |
 | `ALLOWED_HOSTS` | — | Extra `host:port` values allowed in the Host header, comma-separated (e.g. `192.168.1.20:3000`). Requests for any other host get 421 |
 | `COOKIE_SECURE` | `false` | Set `true` when serving over HTTPS so the session cookie is never sent over plain HTTP |
-| `TRUST_PROXY` | — | Set `1` when running behind a reverse proxy (Caddy, nginx) so client IPs are correct for rate limiting |
+| `TRUST_PROXY` | — | Set when running behind a reverse proxy so client IPs are correct for rate limiting. `1` trusts a proxy on this machine (loopback) only; for a proxy on another host give its address or CIDR (e.g. `10.0.0.5`). `X-Forwarded-For` from any other sender is ignored |
 | `DB_PATH` | `data/bootcamp.db` | SQLite file location |
 | `SESSION_SECRET` | auto-generated | Override the generated session secret |
 
@@ -47,7 +47,10 @@ Each week is plain Markdown in `data/weeks/weekNN.md`, structured with `@@` dire
 - Default-deny auth: every `/api` route needs a session except login, register and logout.
 - bcrypt password hashes (8 characters to 72 bytes), constant-time login (no username enumeration via timing).
 - SQLite-backed sessions: httpOnly, SameSite=Strict, optional `secure`; regenerated on login; changing your password signs out all other sessions.
-- Rate limits: failed logins per IP+username and per IP, sign-ups per IP, wrong current-password attempts per user.
+- Rate limits: all login attempts per IP plus failed logins per IP+username and per IP, sign-ups per IP, wrong current-password attempts per user, "email already in use" answers per user, and row-creating saves per user (600/hour).
+- bcrypt on a worker thread, so one login doesn't stall other users; at most 10 live sessions per account.
+- Storage bounds per user: newest 20 quiz attempts per week, 200 activity entries per day, daily logs only for the past year.
+- Browser data (quiz drafts, timer) is bound to the logged-in account and cleared on logout or when a different account logs in.
 - Strict CSP (no inline scripts), `nosniff`, `X-Frame-Options: DENY`, `no-referrer`; all user content is HTML-escaped.
 - JSON-only state-changing requests (CSRF defence); server-side validation of every field; parameterised SQL scoped to the session user.
 - Quiz model answers are only sent after you submit your answers.

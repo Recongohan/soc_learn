@@ -30,6 +30,20 @@
     del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } }
   };
 
+  // Per-user browser data (quiz drafts, timer, open sections) lives under 'socbc.' keys and is
+  // bound to the account in 'socbc.owner', so it never leaks to another account on a shared browser.
+  function clearUserStorage() {
+    try {
+      Object.keys(localStorage).filter(k => k.startsWith('socbc.')).forEach(k => localStorage.removeItem(k));
+    } catch { /* storage unavailable */ }
+  }
+  function bindStorageToUser(userId) {
+    if (store.get('socbc.owner', null) !== userId) {
+      clearUserStorage(); // a different (or unknown) account used this browser before
+      store.set('socbc.owner', userId);
+    }
+  }
+
   const state = { user: null, course: null, streak: null, weekSummary: null };
 
   // ── Sidebar ──
@@ -113,14 +127,18 @@
   let timerTick = null;
   function renderTimerBar() {
     const bar = document.getElementById('timer-bar');
-    const t = timer.get();
+    let t = timer.get();
     clearInterval(timerTick);
+    // Only trust a well-formed timer record (it comes from localStorage).
+    if (t && !(Number.isInteger(t.week) && UI.SECTION_ORDER.includes(t.section) && Number.isFinite(t.start))) {
+      store.del('socbc.timer'); t = null;
+    }
     if (!t || !state.user) { bar.hidden = true; return; }
     bar.hidden = false;
     const draw = () => {
       const s = Math.floor((Date.now() - t.start) / 1000);
       const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60;
-      bar.innerHTML = `<span class="pulse" aria-hidden="true"></span> Timing <a href="#/week/${t.week}">Week ${t.week} · ${UI.SECTION_LABELS[t.section]}</a>
+      bar.innerHTML = `<span class="pulse" aria-hidden="true"></span> Timing <a href="#/week/${esc(t.week)}">Week ${esc(t.week)} · ${esc(UI.SECTION_LABELS[t.section])}</a>
         <span class="mono">${hh ? hh + ':' : ''}${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}</span>
         <button type="button" class="btn btn-sm btn-ghost" data-action="timer-stop">Stop &amp; save</button>`;
     };
@@ -164,6 +182,7 @@
   }
 
   async function onLogin(user) {
+    bindStorageToUser(user.id);
     state.user = user;
     state.course = await api.get('/api/course');
     await refreshMeta();
@@ -173,6 +192,7 @@
   async function logout() {
     if (timer.get()) await timer.stop();
     await api.post('/api/logout').catch(() => {});
+    clearUserStorage(); // explicit logout: leave nothing behind for the next person
     Object.assign(state, { user: null, course: null, streak: null, weekSummary: null });
     renderSidebar();
     renderTimerBar();
