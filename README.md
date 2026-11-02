@@ -12,7 +12,19 @@ npm start          # → http://127.0.0.1:3000
 
 Node 18+ required. Data lives in `data/bootcamp.db` (SQLite, created on first run). The session secret is generated into `data/.secret`. Both are git-ignored.
 
-Environment options: `PORT` (default 3000), `HOST` (default `127.0.0.1`; set `0.0.0.0` to reach it from a tablet on your LAN), `DB_PATH`, `SESSION_SECRET`.
+Environment options (put them in a `.env`-style shell export; `.env*` files are git-ignored):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | Port to listen on |
+| `HOST` | `127.0.0.1` | Interface to bind. `0.0.0.0` exposes it on your LAN — see the warning below |
+| `ALLOWED_HOSTS` | — | Extra `host:port` values allowed in the Host header, comma-separated (e.g. `192.168.1.20:3000`). Requests for any other host get 421 |
+| `COOKIE_SECURE` | `false` | Set `true` when serving over HTTPS so the session cookie is never sent over plain HTTP |
+| `TRUST_PROXY` | — | Set `1` when running behind a reverse proxy (Caddy, nginx) so client IPs are correct for rate limiting |
+| `DB_PATH` | `data/bootcamp.db` | SQLite file location |
+| `SESSION_SECRET` | auto-generated | Override the generated session secret |
+
+> **Using it from a tablet or another machine?** Plain `HOST=0.0.0.0` sends your password and session cookie unencrypted over Wi-Fi. Put it behind HTTPS instead — e.g. `tailscale serve 3000` or Caddy with `reverse_proxy 127.0.0.1:3000` — and run with `TRUST_PROXY=1 COOKIE_SECURE=true ALLOWED_HOSTS=<your-hostname>`.
 
 ## What's inside
 
@@ -31,7 +43,14 @@ Each week is plain Markdown in `data/weeks/weekNN.md`, structured with `@@` dire
 
 ## Security notes
 
-The server binds to loopback by default. It uses bcrypt password hashes, SQLite-backed sessions (httpOnly, SameSite=strict), a strict CSP (no inline scripts), JSON-only state-changing requests (CSRF defence), login throttling, and server-side input validation. Quiz model answers are only sent after you submit your answers.
+- Binds to loopback by default; Host-header allowlist blocks DNS-rebinding attacks.
+- Default-deny auth: every `/api` route needs a session except login, register and logout.
+- bcrypt password hashes (8 characters to 72 bytes), constant-time login (no username enumeration via timing).
+- SQLite-backed sessions: httpOnly, SameSite=Strict, optional `secure`; regenerated on login; changing your password signs out all other sessions.
+- Rate limits: failed logins per IP+username and per IP, sign-ups per IP, wrong current-password attempts per user.
+- Strict CSP (no inline scripts), `nosniff`, `X-Frame-Options: DENY`, `no-referrer`; all user content is HTML-escaped.
+- JSON-only state-changing requests (CSRF defence); server-side validation of every field; parameterised SQL scoped to the session user.
+- Quiz model answers are only sent after you submit your answers.
 
 ## Layout
 

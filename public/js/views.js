@@ -639,9 +639,9 @@
           toast('Profile saved', 'success');
           root.querySelector('h1').textContent = res.user.display_name;
         } else {
-          await App.api.post('/api/password', f);
+          const pw = await App.api.post('/api/password', f);
           e.target.reset();
-          toast('Password updated', 'success');
+          toast(pw.otherSessionsRevoked ? `Password updated — signed out ${pw.otherSessionsRevoked} other session(s)` : 'Password updated', 'success');
         }
       } catch (err) { toast(err.message, 'error'); }
     });

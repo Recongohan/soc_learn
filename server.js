@@ -11,9 +11,24 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 // Bind to loopback by default: this is a personal app. Set HOST=0.0.0.0 to expose it on your LAN.
 const HOST = process.env.HOST || '127.0.0.1';
 
+// Set COOKIE_SECURE=true when serving over HTTPS (e.g. behind Caddy/Tailscale). Set TRUST_PROXY=1 behind a reverse proxy.
+const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
+// Hostnames allowed in the Host header (DNS-rebinding defence). Add your LAN hostname/IP via ALLOWED_HOSTS=a:3000,b:3000.
+const ALLOWED_HOSTS = new Set([
+  `localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`,
+  ...(process.env.ALLOWED_HOSTS || '').split(',').map(h => h.trim().toLowerCase()).filter(Boolean)
+]);
+
 const sqlite = db.init();
 const app = express();
 app.disable('x-powered-by');
+if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
+
+// Reject requests whose Host header isn't ours, so a malicious site can't DNS-rebind onto this server.
+app.use((req, res, next) => {
+  if (ALLOWED_HOSTS.has(String(req.headers.host || '').toLowerCase())) return next();
+  res.status(421).type('text/plain').send('Misdirected request: host not allowed. Add it to ALLOWED_HOSTS.');
+});
 
 // ── Session secret: generated once and kept in data/.secret (git-ignored) ──
 function loadSecret() {
@@ -45,7 +60,7 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   rolling: true,
-  cookie: { httpOnly: true, sameSite: 'strict', maxAge: 30 * 24 * 60 * 60 * 1000 }
+  cookie: { httpOnly: true, sameSite: 'strict', secure: COOKIE_SECURE, maxAge: 30 * 24 * 60 * 60 * 1000 }
 }));
 
 // CSRF defence: state-changing API calls must be JSON (cross-site forms can't send that without a CORS preflight).
@@ -55,6 +70,12 @@ app.use('/api', (req, res, next) => {
   }
   next();
 });
+
+// Default-deny: every /api route requires a logged-in session except this allowlist.
+// (Routes still call requireAuth individually as a second layer.)
+const PUBLIC_API = new Set(['POST /login', 'POST /register', 'POST /logout']);
+app.use('/api', (req, res, next) =>
+  PUBLIC_API.has(`${req.method} ${req.path}`) ? next() : requireAuth(req, res, next));
 
 // ── Helpers ──
 const SECTIONS = db.SECTIONS;
@@ -83,18 +104,39 @@ function isValidDate(s) {
 function str(v, max) { return typeof v === 'string' ? v.slice(0, max) : ''; }
 const bad = (res, msg) => res.status(400).json({ error: msg });
 
-// Simple in-memory login throttle: 10 failures per IP per 15 minutes.
-const failures = new Map();
-function throttled(ip) {
-  const f = failures.get(ip);
-  if (!f || Date.now() - f.first > 15 * 60 * 1000) { failures.delete(ip); return false; }
-  return f.count >= 10;
+// bcrypt only uses the first 72 bytes of a password — reject longer ones instead of silently truncating.
+function passwordProblem(pw) {
+  if (pw.length < 8) return 'Password must be at least 8 characters';
+  if (Buffer.byteLength(pw, 'utf8') > 72) return 'Password must be at most 72 bytes';
+  return null;
 }
-function recordFailure(ip) {
-  const f = failures.get(ip);
-  if (!f || Date.now() - f.first > 15 * 60 * 1000) failures.set(ip, { count: 1, first: Date.now() });
-  else f.count++;
+
+/**
+ * Fixed-window rate limiter. In-memory is a deliberate choice: this is a single-process app
+ * on the learner's own machine, so there's no fleet to share state with. Expired windows are pruned.
+ */
+class RateLimiter {
+  constructor(max, windowMs) { this.max = max; this.windowMs = windowMs; this.hits = new Map(); }
+  entry(key) {
+    const e = this.hits.get(key);
+    if (!e || Date.now() - e.start > this.windowMs) return null;
+    return e;
+  }
+  blocked(key) { const e = this.entry(key); return !!e && e.count >= this.max; }
+  hit(key) {
+    const e = this.entry(key);
+    if (e) e.count++; else this.hits.set(key, { count: 1, start: Date.now() });
+  }
+  reset(key) { this.hits.delete(key); }
+  prune() { for (const [k, e] of this.hits) if (Date.now() - e.start > this.windowMs) this.hits.delete(k); }
 }
+const MIN = 60 * 1000;
+const loginByAccount = new RateLimiter(10, 15 * MIN); // failed logins per IP + username
+const loginByIp = new RateLimiter(50, 15 * MIN);      // failed logins per IP across all usernames (spraying)
+const registerByIp = new RateLimiter(10, 60 * MIN);   // account creations per IP
+const passwordByUser = new RateLimiter(10, 15 * MIN); // failed current-password checks per user
+setInterval(() => [loginByAccount, loginByIp, registerByIp, passwordByUser].forEach(l => l.prune()), 5 * MIN).unref();
+const tooMany = (res, what) => res.status(429).json({ error: `Too many ${what}. Try again later.` });
 
 function startSession(req, res, userId, payload) {
   req.session.regenerate(err => {
@@ -106,6 +148,7 @@ function startSession(req, res, userId, payload) {
 
 // ── Auth ──
 app.post('/api/register', (req, res) => {
+  if (registerByIp.blocked(req.ip)) return tooMany(res, 'sign-up attempts');
   const username = str(req.body.username, 40).trim();
   const email = str(req.body.email, 120).trim();
   const password = str(req.body.password, 200);
@@ -113,7 +156,9 @@ app.post('/api/register', (req, res) => {
   if (!username || !email || !password) return bad(res, 'Username, email and password are required');
   if (!/^[A-Za-z0-9_.-]{3,40}$/.test(username)) return bad(res, 'Username: 3–40 letters, numbers, . _ -');
   if (!EMAIL_RE.test(email)) return bad(res, 'Enter a valid email');
-  if (password.length < 8) return bad(res, 'Password must be at least 8 characters');
+  const pwErr = passwordProblem(password);
+  if (pwErr) return bad(res, pwErr);
+  registerByIp.hit(req.ip);
   try {
     const userId = db.createUser(username, email, password, displayName);
     startSession(req, res, userId, { success: true, user: db.getUser(userId) });
@@ -125,11 +170,15 @@ app.post('/api/register', (req, res) => {
 });
 
 app.post('/api/login', (req, res) => {
-  const ip = req.ip;
-  if (throttled(ip)) return res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
-  const user = db.authenticateUser(str(req.body.username, 120).trim(), str(req.body.password, 200));
-  if (!user) { recordFailure(ip); return res.status(401).json({ error: 'Invalid credentials' }); }
-  failures.delete(ip);
+  const login = str(req.body.username, 120).trim();
+  const accountKey = `${req.ip}|${login.toLowerCase()}`;
+  if (loginByAccount.blocked(accountKey) || loginByIp.blocked(req.ip)) return tooMany(res, 'failed login attempts');
+  const user = db.authenticateUser(login, str(req.body.password, 200));
+  if (!user) {
+    loginByAccount.hit(accountKey); loginByIp.hit(req.ip);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  loginByAccount.reset(accountKey);
   startSession(req, res, user.id, { success: true, user });
 });
 
@@ -163,11 +212,21 @@ app.put('/api/profile', requireAuth, (req, res) => {
 });
 
 app.post('/api/password', requireAuth, (req, res) => {
+  const uid = req.session.userId;
+  if (passwordByUser.blocked(uid)) return tooMany(res, 'incorrect password attempts');
   const current = str(req.body.currentPassword, 200);
   const next = str(req.body.newPassword, 200);
-  if (next.length < 8) return bad(res, 'New password must be at least 8 characters');
-  if (!db.changePassword(req.session.userId, current, next)) return res.status(403).json({ error: 'Current password is incorrect' });
-  res.json({ success: true });
+  const pwErr = passwordProblem(next);
+  if (pwErr) return bad(res, `New p${pwErr.slice(1)}`);
+  if (!db.changePassword(uid, current, next)) {
+    passwordByUser.hit(uid);
+    return res.status(403).json({ error: 'Current password is incorrect' });
+  }
+  passwordByUser.reset(uid);
+  // Log out every other session for this account (e.g. a forgotten shared-machine login).
+  const revoked = sqlite.prepare("DELETE FROM sessions WHERE json_extract(sess, '$.userId') = ? AND sid != ?")
+    .run(uid, req.sessionID).changes;
+  res.json({ success: true, otherSessionsRevoked: revoked });
 });
 
 app.post('/api/reset', requireAuth, (req, res) => {
