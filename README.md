@@ -10,7 +10,7 @@ npm install
 npm start          # → http://127.0.0.1:3000
 ```
 
-Node 18+ required. Data lives in `data/bootcamp.db` (SQLite, created on first run). The session secret is generated into `data/.secret`. Both are git-ignored.
+Node 20, 22 or 24 required (Windows, macOS and Linux install a prebuilt database driver; no Visual Studio needed). Data lives in `data/bootcamp.db` (SQLite, created on first run). The session secret is generated into `data/.secret`. Both are git-ignored.
 
 Environment options (put them in a `.env`-style shell export; `.env*` files are git-ignored):
 
